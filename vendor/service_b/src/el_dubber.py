@@ -48,6 +48,7 @@ EL_DUBBING_SUPPORTED = {
 EL_V4_MODEL = "eleven_v4"           # Best quality, Marathi supported
 EL_V4_TURBO = "eleven_v4_turbo"     # Faster, Marathi supported
 EL_V3_MODEL = "eleven_v3"           # Also Marathi supported
+TTS_ASSEMBLY_VERSION = "cue-fit-v2"
 
 
 def _video_hash(video_path: Path) -> str:
@@ -149,46 +150,231 @@ def _tts_cue(voice_id: str, text: str, out_path: Path, model: str, api_key: str)
     return out_path
 
 
+def _prepare_tts_cues(
+    cues: list[Cue],
+    total_duration_s: float,
+    merge_gap_ms: int = 350,
+    max_block_ms: int = 15_000,
+) -> list[Cue]:
+    """
+    Convert dense OCR/word-level subtitle cues into speakable, non-overlapping
+    narration blocks.
+
+    Visual subtitle extraction can produce 0-250 ms cues, including several cues
+    with the same timestamp. A TTS voice cannot speak those independently without
+    overlap. Consecutive cues are therefore grouped until a real pause is found
+    (or max_block_ms is reached). The returned cue windows never overlap.
+    """
+    limit_ms = max(1, int(round(total_duration_s * 1000)))
+    ordered: list[Cue] = []
+
+    for cue in sorted(cues, key=lambda item: (int(item.start_ms), int(item.id))):
+        text = " ".join(str(cue.text).replace("\n", " ").split())
+        if not text:
+            continue
+
+        start_ms = max(0, min(limit_ms - 1, int(cue.start_ms)))
+        end_ms = max(start_ms, min(limit_ms, int(cue.end_ms)))
+        ordered.append(Cue(cue.id, start_ms, end_ms, text))
+
+    if not ordered:
+        raise PipelineError("No non-empty TTS cues were supplied.")
+
+    groups: list[list[Cue]] = []
+    current: list[Cue] = []
+
+    for cue in ordered:
+        if not current:
+            current = [cue]
+            continue
+
+        block_start = int(current[0].start_ms)
+        previous_end = max(int(current[-1].start_ms), int(current[-1].end_ms))
+        proposed_end = max(int(cue.start_ms), int(cue.end_ms))
+        gap_ms = max(0, int(cue.start_ms) - previous_end)
+
+        if gap_ms <= merge_gap_ms and proposed_end - block_start <= max_block_ms:
+            current.append(cue)
+        else:
+            groups.append(current)
+            current = [cue]
+
+    if current:
+        groups.append(current)
+
+    prepared: list[Cue] = []
+    for index, group in enumerate(groups):
+        start_ms = int(group[0].start_ms)
+        next_start_ms = (
+            int(groups[index + 1][0].start_ms)
+            if index + 1 < len(groups)
+            else limit_ms
+        )
+        end_ms = max(start_ms + 1, min(limit_ms, next_start_ms))
+
+        parts: list[str] = []
+        previous_text = None
+        for cue in group:
+            text = cue.text.strip()
+            folded = text.casefold()
+            if text and folded != previous_text:
+                parts.append(text)
+                previous_text = folded
+
+        if parts and end_ms > start_ms:
+            prepared.append(Cue(group[0].id, start_ms, end_ms, " ".join(parts)))
+
+    if not prepared:
+        raise PipelineError("TTS cue normalization produced no speakable windows.")
+
+    if len(prepared) != len(ordered):
+        print(
+            f"[Dubber] Consolidated {len(ordered)} dense subtitle cues into "
+            f"{len(prepared)} non-overlapping narration blocks."
+        )
+    return prepared
+
+
+def _probe_audio_duration(audio_path: Path) -> float:
+    """Return decoded audio duration in seconds."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode:
+        raise PipelineError(
+            f"Could not read TTS cue duration for {audio_path.name}: {result.stderr}"
+        )
+    try:
+        duration = float(result.stdout.strip())
+    except (TypeError, ValueError) as exc:
+        raise PipelineError(
+            f"Invalid TTS cue duration for {audio_path.name}: {result.stdout!r}"
+        ) from exc
+    if duration <= 0:
+        raise PipelineError(f"TTS cue is empty: {audio_path}")
+    return duration
+
+
+def _atempo_filters(speed: float) -> list[str]:
+    """
+    Build an FFmpeg atempo chain. Each stage stays within the portable 0.5-2.0
+    range, while the whole chain can fit unusually long translations.
+    """
+    if speed <= 1.0005:
+        return []
+
+    filters: list[str] = []
+    remaining = speed
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    filters.append(f"atempo={remaining:.8f}")
+    return filters
+
+
 def _assemble_tts_audio(
     cues: list[Cue], cue_audio_paths: list[Path],
     total_duration_s: float, out_path: Path
 ) -> Path:
     """
-    Assemble per-cue audio files into a single full-length audio track.
-    Each cue is placed at its start_ms position. Gaps are silence.
+    Assemble one full-length, frame-aligned narration track.
+
+    Every cue is time-fitted to its exclusive SRT window before it is delayed and
+    mixed. This prevents a long Marathi utterance from continuing underneath the
+    following cue. The limiter is only a final safety net; correct timing comes
+    from the per-cue trim/pad operation.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Build ffmpeg complex filter
-    inputs = []
-    filter_parts = []
-    delay_parts = []
+    inputs: list[str] = []
+    filter_parts: list[str] = []
+    mix_inputs: list[str] = []
+    input_index = 0
 
-    for i, (cue, audio_path) in enumerate(zip(cues, cue_audio_paths)):
-        if not audio_path.exists():
+    for cue, audio_path in zip(cues, cue_audio_paths):
+        audio_path = Path(audio_path)
+        if not audio_path.exists() or audio_path.stat().st_size == 0:
             continue
-        start_ms = int(cue.start_ms)
-        inputs += ["-i", str(audio_path)]
-        filter_parts.append(f"[{i}:a]adelay={start_ms}|{start_ms}[a{i}]")
-        delay_parts.append(f"[a{i}]")
 
-    if not delay_parts:
-        raise PipelineError("No cue audio files were generated.")
+        start_ms = max(0, int(cue.start_ms))
+        end_ms = min(int(round(total_duration_s * 1000)), int(cue.end_ms))
+        if end_ms <= start_ms:
+            print(
+                f"[Dubber] Skipping cue {cue.id}: invalid window "
+                f"{start_ms}ms -> {end_ms}ms"
+            )
+            continue
 
-    mix_filter = "".join(delay_parts) + f"amix=inputs={len(delay_parts)}:normalize=0[out]"
-    full_filter = ";".join(filter_parts) + ";" + mix_filter
+        window_s = (end_ms - start_ms) / 1000.0
+        guard_s = min(0.060, window_s * 0.15)
+        speech_window_s = max(0.040, window_s - guard_s)
+        audio_duration_s = _probe_audio_duration(audio_path)
+        speed = max(1.0, audio_duration_s / speech_window_s)
+
+        if speed > 1.20:
+            print(
+                f"[Dubber] Cue {cue.id}: fitting {audio_duration_s:.2f}s into "
+                f"{speech_window_s:.2f}s (speed {speed:.2f}x)"
+            )
+
+        chain = [
+            "aresample=48000",
+            "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono",
+            "asetpts=PTS-STARTPTS",
+            *_atempo_filters(speed),
+            f"atrim=duration={speech_window_s:.6f}",
+            "asetpts=PTS-STARTPTS",
+        ]
+
+        fade_s = min(0.020, speech_window_s / 4.0)
+        if fade_s > 0.001:
+            fade_out_start = max(0.0, speech_window_s - fade_s)
+            chain.extend([
+                f"afade=t=in:st=0:d={fade_s:.6f}",
+                f"afade=t=out:st={fade_out_start:.6f}:d={fade_s:.6f}",
+            ])
+
+        chain.extend([
+            f"apad=pad_dur={window_s:.6f}",
+            f"atrim=duration={window_s:.6f}",
+            f"adelay={start_ms}:all=1",
+        ])
+
+        inputs.extend(["-i", str(audio_path)])
+        label = f"a{input_index}"
+        filter_parts.append(f"[{input_index}:a]{','.join(chain)}[{label}]")
+        mix_inputs.append(f"[{label}]")
+        input_index += 1
+
+    if not mix_inputs:
+        raise PipelineError("No valid cue audio files were generated.")
+
+    mix_filter = (
+        "".join(mix_inputs)
+        + f"amix=inputs={len(mix_inputs)}:duration=longest:"
+          "dropout_transition=0:normalize=0,"
+          "alimiter=limit=0.95,"
+        + f"apad=pad_dur={total_duration_s:.6f},"
+          f"atrim=duration={total_duration_s:.6f},"
+          "asetpts=PTS-STARTPTS[out]"
+    )
+    full_filter = ";".join(filter_parts + [mix_filter])
 
     cmd = [
         "ffmpeg", "-y", "-nostdin",
         *inputs,
         "-filter_complex", full_filter,
         "-map", "[out]",
-        "-t", f"{total_duration_s:.6f}",
+        "-ar", "48000", "-ac", "1",
         "-acodec", "libmp3lame", "-q:a", "2",
         str(out_path),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode:
-        raise PipelineError(f"TTS audio assembly failed: {r.stderr}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode:
+        raise PipelineError(f"TTS audio assembly failed:\n{result.stderr}")
     return out_path
 
 
@@ -315,13 +501,21 @@ def run_dubbing(
     dubbed_srt = job_dir / f"transcript_{target_lang}.srt"
     job_id_path = job_dir / f"el_dubbing_id_{target_lang}.txt"
 
-    # Cache check — ignore PLACEHOLDER files from dry-runs (< 500KB is likely a placeholder)
+    # Cache check — Mode B also requires the current timing-assembly version.
+    # This invalidates master audio created by the old overlapping amix pipeline.
     REAL_AUDIO_MIN_BYTES = 500 * 1024  # 500KB
+    assembly_version_path = job_dir / f"tts_assembly_version_{target_lang}.txt"
+    mode_b_cache_current = (
+        assembly_version_path.exists()
+        and assembly_version_path.read_text(encoding="utf-8").strip()
+        == TTS_ASSEMBLY_VERSION
+    )
     if (dubbed_audio.exists()
             and dubbed_audio.stat().st_size >= REAL_AUDIO_MIN_BYTES
             and dubbed_srt.exists()
             and dubbed_srt.stat().st_size > 100
-            and "PLACEHOLDER" not in dubbed_audio.name):
+            and "PLACEHOLDER" not in dubbed_audio.name
+            and (target_lang in EL_DUBBING_SUPPORTED or mode_b_cache_current)):
         print(f"[Dubber] Cache hit — reusing {dubbed_audio.name} ({dubbed_audio.stat().st_size // 1024}KB)")
         cues = parse_srt(dubbed_srt.read_text(encoding="utf-8")) if dubbed_srt.exists() else []
         return dubbed_audio, dubbed_srt, cues
@@ -384,25 +578,31 @@ def run_dubbing(
     voice_name = f"DubClone_{video_path.stem[:20]}"
     voice_id = _ensure_voice_clone(sample_wav, voice_name, api_key)
 
-    # Step B3: TTS each cue
-    cue_dir = job_dir / f"tts_cues_{target_lang}"
-    cue_dir.mkdir(parents=True, exist_ok=True)
-    cue_audio_paths = []
-    print(f"[Dubber] Generating {len(target_cues)} TTS cues in {target_lang}...")
-    for cue in target_cues:
-        cue_out = cue_dir / f"cue_{cue.id:04d}.mp3"
-        if not cue_out.exists():
-            text = cue.text.strip()
-            if text:
-                _tts_cue(voice_id, text, cue_out, tts_model, api_key)
-        cue_audio_paths.append(cue_out)
-
-    # Step B4: Assemble into full-length audio
+    # Step B3: Consolidate dense/zero-duration visual cues into narration blocks.
     from .scene_analyzer import get_video_info
     info = get_video_info(video_path)
     total_dur = info["duration"]
+    tts_cues = _prepare_tts_cues(target_cues, total_dur)
+
+    # Include the normalized text hash in the cache key. Old one-word TTS clips
+    # must not be reused for a newly consolidated narration block.
+    cue_dir = job_dir / f"tts_cues_{target_lang}_{TTS_ASSEMBLY_VERSION}"
+    cue_dir.mkdir(parents=True, exist_ok=True)
+    cue_audio_paths = []
+    print(f"[Dubber] Generating {len(tts_cues)} fitted TTS blocks in {target_lang}...")
+    for cue in tts_cues:
+        text = cue.text.strip()
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+        cue_out = cue_dir / f"cue_{cue.id:04d}_{text_hash}.mp3"
+        if text and not cue_out.exists():
+            _tts_cue(voice_id, text, cue_out, tts_model, api_key)
+        cue_audio_paths.append(cue_out)
+
+    # Step B4: Fit every narration block to its exclusive timeline window,
+    # then assemble one master track with no simultaneous cue speech.
     print(f"[Dubber] Assembling {len(cue_audio_paths)} cues into {total_dur:.2f}s audio track...")
-    _assemble_tts_audio(target_cues, cue_audio_paths, total_dur, dubbed_audio)
+    _assemble_tts_audio(tts_cues, cue_audio_paths, total_dur, dubbed_audio)
+    assembly_version_path.write_text(TTS_ASSEMBLY_VERSION, encoding="utf-8")
     print(f"[Dubber] Mode B complete → {dubbed_audio.name} ({dubbed_audio.stat().st_size//1024}KB)")
 
     return dubbed_audio, dubbed_srt, target_cues

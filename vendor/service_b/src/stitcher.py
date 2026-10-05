@@ -2,7 +2,8 @@
 Stage 5 — Frame-Locked Master Stitch
 Concatenates all processed segments in exact scene order.
 Validates final frame count == source frame count before writing output.
-Uses ffmpeg concat (stream copy) for zero-drift assembly.
+Normalizes segments to a common CFR/timebase, then performs one deterministic
+final encode so variable-rate cloud clips cannot introduce timestamp drift.
 """
 import subprocess
 from pathlib import Path
@@ -94,24 +95,36 @@ def stitch_segments(
         "-i", str(concat_txt),
     ]
 
-    if master_audio and Path(master_audio).exists():
+    has_master_audio = bool(master_audio and Path(master_audio).exists())
+    if has_master_audio:
+        # The segment tracks are video-only, so this maps exactly one audio
+        # source. Reset its timestamps, smooth tiny clock discontinuities, and
+        # pad/trim it to the source duration. This cannot mix duplicate voices.
+        audio_filter = (
+            f"aresample=48000:async=1:first_pts=0,"
+            f"asetpts=PTS-STARTPTS,"
+            f"apad=pad_dur={src_duration:.9f},"
+            f"atrim=duration={src_duration:.9f}"
+        )
         cmd += [
             "-i", str(master_audio),
             "-map", "0:v:0", "-map", "1:a:0",
-            "-vf", f"fps={fps}",
+            "-vf", f"fps={fps},setpts=PTS-STARTPTS",
+            "-af", audio_filter,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-frames:v", str(src_frames),
             "-movflags", "+faststart",
-            "-t", f"{src_duration:.9f}",
             str(output_path),
         ]
     else:
         cmd += [
-            "-vf", f"fps={fps}",
+            "-map", "0:v:0",
+            "-vf", f"fps={fps},setpts=PTS-STARTPTS",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
+            "-frames:v", str(src_frames),
+            "-an",
             "-movflags", "+faststart",
-            "-t", f"{src_duration:.9f}",
             str(output_path),
         ]
 
