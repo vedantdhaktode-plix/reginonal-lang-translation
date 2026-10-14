@@ -29,12 +29,14 @@ def run_dubbing_engine(
     target_lang: str,
     source_lang: str = "auto",
     job_dir: Path = None,
-    sync_model: str = "lipsync-2-pro",
+    sync_model: str = "lipsync-2",
     scene_threshold: float = 32.0,
     target_frame: float = None,
     target_point: tuple = None,
     reference_image: Path = None,
     supplied_transcript: Path = None,
+    supplied_source_transcript: Path = None,
+    reviewed_translation_srt: Path = None,
     num_speakers: int = 0,
     dry_run: bool = False,
     skip_stages: list[int] = None,
@@ -47,7 +49,7 @@ def run_dubbing_engine(
         target_lang         : BCP-47 target language code (e.g. 'mr', 'hi', 'en')
         source_lang         : Source language code or 'auto'
         job_dir             : Output directory (auto-named from video stem if None)
-        sync_model          : Sync Labs model ('lipsync-2-pro' default)
+        sync_model          : Sync Labs model ('lipsync-2' default)
         scene_threshold     : Camera cut detection sensitivity
         target_frame        : Timestamp (s) in video showing the target speaker
         target_point        : (x, y) pixel inside her face for disambiguation
@@ -95,7 +97,7 @@ def run_dubbing_engine(
             video_path=source_video,
             job_dir=job_dir,
             source_lang=source_lang,
-            supplied_srt=supplied_transcript,
+            supplied_srt=supplied_source_transcript or supplied_transcript,
         )
     else:
         lang_tag = source_lang if source_lang and source_lang != "auto" else "src"
@@ -176,7 +178,7 @@ def run_dubbing_engine(
                 source_lang=source_lang,
                 num_speakers=num_speakers,
                 source_cues=source_cues,
-                translated_srt=supplied_transcript if supplied_transcript else None,
+                translated_srt=reviewed_translation_srt,
             )
 
     else:

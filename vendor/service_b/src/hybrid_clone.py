@@ -1,6 +1,6 @@
 """
 Hybrid Clone Video Dubbing Module
-Combines targeted Sync Labs lipsync-2-pro on presenter shots with ElevenLabs
+Combines targeted Sync Labs lipsync-2 on presenter shots with ElevenLabs
 Instant Voice Cloning for pristine B-roll voiceovers with zero drift and zero loops.
 Automatically detects speaker identity when multiple persons appear.
 """
@@ -12,7 +12,7 @@ import requests
 import subprocess
 from pathlib import Path
 
-from .common import PipelineError, load_env, write_json, read_json
+from .common import PipelineError, load_env, write_json, read_json, request_with_retry
 from .scene_analyzer import get_video_info, detect_scenes, extract_subclip
 from .srt_parser import parse_srt
 from .synclabs_client import SyncLabsClient
@@ -25,7 +25,7 @@ def ensure_voice_clone(audio_sample_path, voice_name=None, api_key=None):
         raise PipelineError("Set ELEVENLABS_API_KEY in .env or your environment.")
 
     headers = {"xi-api-key": api_key}
-    r = requests.get("https://api.elevenlabs.io/v1/voices", headers=headers, timeout=30)
+    r = request_with_retry("GET", "https://api.elevenlabs.io/v1/voices", headers=headers, timeout=30, log_prefix="[Hybrid Clone Voices]")
     if r.ok:
         voices = r.json().get("voices", [])
         if voice_name:
@@ -44,7 +44,15 @@ def ensure_voice_clone(audio_sample_path, voice_name=None, api_key=None):
     with open(audio_sample_path, "rb") as f:
         files = {"files": ("reference_sample.wav", f, "audio/wav")}
         data = {"name": v_name, "description": "High fidelity voice clone for B-roll voiceovers"}
-        resp = requests.post("https://api.elevenlabs.io/v1/voices/add", headers=headers, data=data, files=files, timeout=60)
+        resp = request_with_retry(
+            "POST",
+            "https://api.elevenlabs.io/v1/voices/add",
+            headers=headers,
+            data=data,
+            files=files,
+            timeout=60,
+            log_prefix="[Hybrid Clone Voice Add]",
+        )
         if not resp.ok:
             raise PipelineError(f"ElevenLabs voice clone failed: HTTP {resp.status_code} - {resp.text}")
         voice_id = resp.json()["voice_id"]
@@ -66,7 +74,7 @@ def generate_tts_voiceover(voice_id, text, output_path, model="eleven_multilingu
             "use_speaker_boost": True
         }
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    resp = request_with_retry("POST", url, headers=headers, json=payload, timeout=60, log_prefix="[Hybrid Clone TTS]")
     if not resp.ok:
         raise PipelineError(f"ElevenLabs TTS failed: HTTP {resp.status_code} - {resp.text}")
     
@@ -86,7 +94,7 @@ def time_fit_voiceover(input_audio, output_audio, target_duration, delay_ms=160)
     raw_duration = float(probe.stdout.strip())
     speech_duration = target_duration - (delay_ms / 1000.0)
     tempo = raw_duration / speech_duration
-    tempo = max(0.5, min(2.0, tempo))
+    tempo = max(0.95, min(1.20, tempo))
 
     af_filters = [f"atempo={tempo:.4f}"]
     if delay_ms > 0:
@@ -129,7 +137,7 @@ def run_hybrid_clone(
     source_video_path,
     target_lang="en",
     job_dir=None,
-    sync_model="lipsync-2-pro",
+    sync_model="lipsync-2",
     dry_run=False,
     hook_text=None
 ):

@@ -19,9 +19,11 @@ class JobStore:
                 job_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 stage TEXT NOT NULL,
+                review_step TEXT NOT NULL DEFAULT 'processing',
                 target_language TEXT NOT NULL,
                 source_language TEXT NOT NULL,
                 operation TEXT NOT NULL DEFAULT 'combine',
+                add_auto_captions INTEGER NOT NULL DEFAULT 0,
                 input_path TEXT NOT NULL,
                 input_name TEXT NOT NULL,
                 artifacts TEXT NOT NULL DEFAULT '{}',
@@ -32,6 +34,10 @@ class JobStore:
             columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
             if "operation" not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN operation TEXT NOT NULL DEFAULT 'combine'")
+            if "review_step" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN review_step TEXT NOT NULL DEFAULT 'processing'")
+            if "add_auto_captions" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN add_auto_captions INTEGER NOT NULL DEFAULT 0")
             # A worker process may have stopped while a job was active. Keep its
             # uploaded source and retry it from the beginning after restart.
             db.execute(
@@ -48,13 +54,46 @@ class JobStore:
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def create(self, job_id: str, target: str, source: str, input_path: Path, input_name: str, operation: str = "combine") -> None:
+    def create(
+        self,
+        job_id: str,
+        target: str,
+        source: str,
+        input_path: Path,
+        input_name: str,
+        operation: str = "combine",
+        add_auto_captions: bool = False,
+    ) -> None:
         now = self._now()
+        review_step = "source_transcript" if operation in {"dubbing", "combine"} else "processing"
         with self._lock, self._connect() as db:
             db.execute(
-                "INSERT INTO jobs(job_id,status,stage,target_language,source_language,operation,input_path,input_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (job_id, "queued", "queued", target, source, operation, str(input_path), input_name, now, now),
+                "INSERT INTO jobs(job_id,status,stage,review_step,target_language,source_language,operation,add_auto_captions,input_path,input_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, "queued", "queued", review_step, target, source, operation, int(add_auto_captions), str(input_path), input_name, now, now),
             )
+        self._write_manifest(job_id)
+
+    def pause_for_review(self, job_id: str, stage: str, next_step: str, artifacts: dict[str, str]) -> None:
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT artifacts FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            combined = json.loads(row["artifacts"])
+            combined.update(artifacts)
+            db.execute(
+                "UPDATE jobs SET status='review_required',stage=?,review_step=?,artifacts=?,updated_at=? WHERE job_id=?",
+                (stage, next_step, json.dumps(combined), self._now(), job_id),
+            )
+        self._write_manifest(job_id)
+
+    def resume_review(self, job_id: str, next_step: str) -> None:
+        with self._lock, self._connect() as db:
+            updated = db.execute(
+                "UPDATE jobs SET status='queued',stage='queued',review_step=?,updated_at=? WHERE job_id=? AND status='review_required'",
+                (next_step, self._now(), job_id),
+            ).rowcount
+            if not updated:
+                raise ValueError("This job is not waiting for review.")
         self._write_manifest(job_id)
 
     def claim(self) -> dict[str, Any] | None:
@@ -83,10 +122,24 @@ class JobStore:
 
     def finish(self, job_id: str, artifacts: dict[str, str]) -> None:
         with self._lock, self._connect() as db:
+            row = db.execute("SELECT artifacts FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            combined = json.loads(row["artifacts"]) if row else {}
+            combined.update(artifacts)
             db.execute(
                 "UPDATE jobs SET status='completed',stage='completed',artifacts=?,error=NULL,updated_at=? WHERE job_id=?",
-                (json.dumps(artifacts), self._now(), job_id),
+                (json.dumps(combined), self._now(), job_id),
             )
+        self._write_manifest(job_id)
+
+    def update_artifacts(self, job_id: str, artifacts: dict[str, str]) -> None:
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT artifacts FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            combined = json.loads(row["artifacts"])
+            combined.update(artifacts)
+            db.execute("UPDATE jobs SET artifacts=?,updated_at=? WHERE job_id=?",
+                       (json.dumps(combined), self._now(), job_id))
         self._write_manifest(job_id)
 
     def fail(self, job_id: str, stage: str, error: str) -> None:
@@ -116,9 +169,11 @@ class JobStore:
             "job_id": record["job_id"],
             "status": record["status"],
             "stage": record["stage"],
+            "review_step": record["review_step"],
             "target_language": record["target_language"],
             "source_language": record["source_language"],
             "operation": record["operation"],
+            "add_auto_captions": bool(record["add_auto_captions"]),
             "input": record["input_name"],
             "artifacts": {
                 name: f"/api/jobs/{job_id}/artifacts/{name}"

@@ -9,6 +9,7 @@ _LANGUAGE_FONTS = {
     'hindi':     'NotoSansDevanagari-Regular',
     'kannada':   'NotoSansKannada-Regular',
     'tamil':     'NotoSansTamil-Regular',
+    'telugu':    'NotoSansTelugu-Regular',
     'malayalam': 'NotoSansMalayalam-Regular',
 }
 
@@ -67,7 +68,11 @@ def assign_styles(segments, metadata, config, document=None):
                     lum = 0.299 * r + 0.587 * g + 0.114 * b
                     if lum < 100 and box_text_color.lower() in ('#000000', 'black'):
                         box_text_color = '#FFFFFF'
-            calc_size = max(24.0, min(metadata.height * 0.054, box.height * 0.46))
+            # Caption-card boxes include background padding. A lower ratio keeps
+            # Indic replacements close to the source glyph height instead of
+            # scaling them to the full panel height.
+            height_ratio = 0.30 if getattr(config, 'pill_mode', False) else 0.46
+            calc_size = max(24.0, min(metadata.height * 0.054, box.height * height_ratio))
             center_x = float(box.x) + float(box.width) / 2.0
             center_y = float(box.y) + float(box.height) / 2.0
             outline_col = '#000000' if box_text_color.upper() == '#FFFFFF' else box_text_color

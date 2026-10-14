@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
@@ -40,12 +41,7 @@ class PipelineServices:
 
 
 class DirectoryLanguagePipeline:
-    """Chain visual subtitle translation into audio dubbing.
-
-    Service A and Service B keep separate subtitle artifacts. Only Service A's
-    video is passed into Service B. The final assembler attaches Service A's
-    visual SRT and uses Service B's audio result.
-    """
+    """Run dubbing, then visual translation, and assemble both tracks."""
 
     def __init__(self, services: PipelineServices):
         self.services = services
@@ -58,6 +54,8 @@ class DirectoryLanguagePipeline:
         source_language: str = "auto",
         job_id: str | None = None,
         on_stage: Callable[[str], None] | None = None,
+        source_transcript: Path | None = None,
+        reviewed_translation: Path | None = None,
     ) -> PipelineResult:
         job_id = job_id or uuid4().hex
         if not target_language.strip():
@@ -65,9 +63,27 @@ class DirectoryLanguagePipeline:
 
         try:
             if on_stage:
+                on_stage("service_b_running")
+            audio = self._invoke(
+                self.services.audio_dubbing, video,
+                target_language=target_language, source_language=source_language, job_id=job_id,
+                source_transcript=source_transcript, reviewed_translation=reviewed_translation,
+            )
+            service_b_video = self._required(audio, "video", "service_b")
+            dubbed_audio = audio.get("audio")
+            audio_srt = audio.get("audio_subtitles")
+            if on_stage:
+                on_stage("service_b_completed")
+        except Exception as exc:
+            if isinstance(exc, PipelineStageError):
+                raise
+            raise PipelineStageError("service_b", "audio dubbing failed", cause=exc) from exc
+
+        try:
+            if on_stage:
                 on_stage("service_a_running")
             visual = self._invoke(
-                self.services.visual_subtitles, video,
+                self.services.visual_subtitles, service_b_video,
                 target_language=target_language, source_language=source_language, job_id=job_id,
             )
             service_a_video = self._required(visual, "video", "service_a")
@@ -81,28 +97,10 @@ class DirectoryLanguagePipeline:
 
         try:
             if on_stage:
-                on_stage("service_b_running")
-            audio = self._invoke(
-                self.services.audio_dubbing, service_a_video,
-                target_language=target_language, source_language=source_language, job_id=job_id,
-            )
-            dubbed_video = audio.get("video")
-            dubbed_audio = audio.get("audio")
-            audio_srt = audio.get("audio_subtitles")
-            if on_stage:
-                on_stage("service_b_completed")
-        except Exception as exc:
-            if isinstance(exc, PipelineStageError):
-                raise
-            raise PipelineStageError("service_b", "audio dubbing failed", cause=exc) from exc
-
-        try:
-            if on_stage:
                 on_stage("finalizing")
-            assembly_video = dubbed_video or service_a_video
             final_video = self.services.assembler.assemble(
-                assembly_video,
-                None if dubbed_video else dubbed_audio,
+                service_a_video,
+                dubbed_audio,
                 visual_srt,
                 job_id=job_id,
             )
@@ -129,7 +127,7 @@ class DirectoryLanguagePipeline:
             "visual_subtitles": visual_srt.uri,
             "audio_subtitles": audio_srt.uri if audio_srt else None,
             "service_a_video": service_a_video.uri,
-            "service_b_video": dubbed_video.uri if dubbed_video else None,
+            "service_b_video": service_b_video.uri,
             "service_b_audio": dubbed_audio.uri if dubbed_audio else None,
             "final_video": final_video.uri,
         }
@@ -140,7 +138,7 @@ class DirectoryLanguagePipeline:
             visual_subtitles=visual_srt,
             audio_subtitles=audio_srt,
             service_a_video=service_a_video,
-            service_b_video=dubbed_video,
+            service_b_video=service_b_video,
             service_b_audio=dubbed_audio,
             manifest=manifest,
         )

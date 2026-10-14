@@ -7,3 +7,5 @@ jobs
 *.sqlite3
 *.db
 tests
+scratch
+output

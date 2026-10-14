@@ -332,7 +332,7 @@ def run_video_dubbing_pipeline(
     4. Detects scenes & selects speech intervals (splitting at camera cuts).
     5. Applies voiceover-aware B-roll filtering (leaves product shots & demonstrations untouched).
     6. Requests CLI confirmation (unless auto_approve is True).
-    7. Submits verified talking-head intervals to Sync Labs (default: lipsync-2-pro, resumable per-interval).
+    7. Submits verified talking-head intervals to Sync Labs (default: lipsync-2, resumable per-interval).
     8. Assembles frame-bounded segments retaining returned Sync audio.
     9. Validates output and records final manifest.
     """
@@ -598,7 +598,7 @@ def run_video_dubbing_pipeline(
         manifest["timeline"] = timeline
         write_json(manifest_path, manifest)
 
-    effective_sync_model = sync_model or os.environ.get("SYNC_MODEL", "lipsync-2-pro")
+    effective_sync_model = sync_model or os.environ.get("SYNC_MODEL", "lipsync-2")
     for item in timeline:
         item["selected_model"] = route_model(item, effective_sync_model, broll_model)
     speech_segments = [s for s in timeline if s["selected_model"]]
@@ -623,7 +623,7 @@ def run_video_dubbing_pipeline(
     print("=" * 65 + "\n")
 
     # Step 4: CLI Approval before Paid Sync Labs Requests
-    effective_sync_model = sync_model or os.environ.get("SYNC_MODEL", "lipsync-2-pro")
+    effective_sync_model = sync_model or os.environ.get("SYNC_MODEL", "lipsync-2")
     if not auto_approve and not dry_run:
         confirm = input(f"Proceed with paid Sync generation for verified presenter shots using {effective_sync_model}? [y/N]: ").strip().lower()
         if confirm not in ("y", "yes"):

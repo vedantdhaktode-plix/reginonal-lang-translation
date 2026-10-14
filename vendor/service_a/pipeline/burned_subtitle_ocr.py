@@ -240,16 +240,17 @@ class GeminiVideoSubtitleExtractor:
                 while self.client.files.get(name=upload.name).state.name == "PROCESSING":
                     time.sleep(1)
                 prompt = (
-                    "This video has spoken dialogue and on-screen burned subtitles.\n"
-                    "Extract all spoken dialogue lines and subtitle segments with precise start and end timestamps in seconds across the entire video from 0s to the end.\n"
-                    "CRITICAL RULE - ONE SENTENCE PER SEGMENT:\n"
-                    "- Keep strictly ONE single sentence or short thought per segment on screen. NEVER merge 2 sentences or multiple clauses together into one long segment.\n"
-                    "- For example, do NOT output 'Don't try this drink, warna kuch din ke baad log aapko pehchan hi nahi payenge!' as one segment.\n"
-                    "  Instead, split into two separate segments:\n"
-                    "  Segment 1: 'Don't try this drink!' (start: 0.0, end: 1.8)\n"
-                    "  Segment 2: 'Warna kuch din ke baad log aapko pehchan hi nahi payenge!' (start: 1.8, end: 4.2)\n"
-                    "- Ensure every segment corresponds to one clean sentence matching the speaker's cadence.\n"
-                    "Return ONLY a valid JSON array of objects with keys: 'start' (float), 'end' (float), 'text' (exact words spoken/burned)."
+                    "Analyze this video ONLY for VISUAL ON-SCREEN SUBTITLE CARDS, CAPTIONS, OR CALL-TO-ACTION TEXT (e.g. 'Comment DM', 'Comment now', etc.).\n\n"
+                    "CRITICAL RULES:\n"
+                    "1. ONLY extract on-screen subtitle cards, burned captions, or call-to-action text overlays.\n"
+                    "2. DO NOT extract spoken audio if there is NO text on screen! If the person is speaking but NO subtitle card appears on screen, DO NOT output any item for that time.\n"
+                    "3. DO NOT extract physical text printed on product bottles, boxes, packaging, labels, or clothing graphics.\n"
+                    "4. For each VISUAL text overlay/card:\n"
+                    "   - start: exact timestamp in seconds when the text appears on screen\n"
+                    "   - end: exact timestamp in seconds when the text disappears\n"
+                    "   - text: exact visible on-screen text\n"
+                    "   - box_2d: [ymin, xmin, ymax, xmax] outer bounding box of the text container normalized to 0-1000\n\n"
+                    "If no subtitle cards or text overlays appear on screen, return an empty array []."
                 )
                 from google.genai import types
                 schema = {
@@ -259,9 +260,14 @@ class GeminiVideoSubtitleExtractor:
                         "properties": {
                             "start": {"type": "NUMBER", "description": "Start time in seconds"},
                             "end": {"type": "NUMBER", "description": "End time in seconds"},
-                            "text": {"type": "STRING", "description": "Exact spoken or burned dialogue"}
+                            "text": {"type": "STRING", "description": "Exact visible on-screen text"},
+                            "box_2d": {
+                                "type": "ARRAY",
+                                "items": {"type": "INTEGER"},
+                                "description": "[ymin, xmin, ymax, xmax] normalized to 0-1000"
+                            }
                         },
-                        "required": ["start", "end", "text"]
+                        "required": ["start", "end", "text", "box_2d"]
                     }
                 }
                 gen_config = types.GenerateContentConfig(
@@ -279,7 +285,7 @@ class GeminiVideoSubtitleExtractor:
                 clean_json = resp.text.replace('```json', '').replace('```', '').strip()
                 raw = json.loads(clean_json)
                 if isinstance(raw, dict):
-                    for k in ('segments', 'subtitles', 'dialogue', 'transcript', 'items', 'results'):
+                    for k in ('segments', 'subtitles', 'cards', 'dialogue', 'transcript', 'items', 'results'):
                         if k in raw and isinstance(raw[k], list):
                             raw = raw[k]
                             break
@@ -288,10 +294,9 @@ class GeminiVideoSubtitleExtractor:
                             if isinstance(v, list):
                                 raw = v
                                 break
-                if not isinstance(raw, list):
+                if not isinstance(raw, list) or not raw:
                     return []
                 segments = []
-                pos = getattr(self.config, 'subtitle_position', 'bottom')
                 meta_h = getattr(metadata, 'height', None)
                 if meta_h is None and isinstance(metadata, dict):
                     meta_h = metadata.get('height') or next((s.get('height') for s in metadata.get('streams', []) if s.get('height')), None)
@@ -307,57 +312,36 @@ class GeminiVideoSubtitleExtractor:
                     meta_dur = metadata.get('duration') or metadata.get('format', {}).get('duration')
                 meta_dur = float(meta_dur or 9999.0)
 
-                # Dynamically detect master title card / subtitle container
-                card_box = None
-                try:
-                    from pipeline.agent_card_detector import AgentCardDetector
-                    detector = AgentCardDetector(self.config)
-                    card_res = detector.detect_master_card(video_path, metadata)
-                    if card_res and card_res.get('card_detected') and card_res.get('bbox'):
-                        card_box = card_res['bbox']
-                except Exception as exc:
-                    import logging
-                    logging.getLogger(__name__).warning('Dynamic master card detection in GeminiVideoSubtitleExtractor failed: %s', exc)
+                patch_color = getattr(self.config, 'overlay_patch_color', '0x000000')
 
-                if card_box:
-                    box_y = card_box.y
-                    box_h = card_box.height
-                    box_w = card_box.width
-                    box_x = card_box.x
-                    patch_color = card_box.patch_color or getattr(self.config, 'overlay_patch_color', '0x000000')
-                else:
-                    if pos == 'top':
-                        box_y = int(meta_h * 0.05)
+                for i, item in enumerate(raw, 1):
+                    start = max(0.0, float(item.get('start', 0.0)))
+                    end = float(item.get('end', start + 1.0))
+                    txt = str(item.get('text', '')).strip()
+                    if not txt or end <= start:
+                        continue
+                    if end >= meta_dur - 1.2:
+                        end = meta_dur
+                    box_2d = item.get('box_2d')
+                    if box_2d and len(box_2d) == 4:
+                        ymin, xmin, ymax, xmax = [max(0, min(1000, int(v))) for v in box_2d]
+                        pad_y = max(4, int((ymax - ymin) * 0.12))
+                        pad_x = max(8, int((xmax - xmin) * 0.10))
+                        ymin = max(0, ymin - pad_y)
+                        ymax = min(1000, ymax + pad_y)
+                        xmin = max(0, xmin - pad_x)
+                        xmax = min(1000, xmax + pad_x)
+                        bx = int(xmin * meta_w / 1000)
+                        by = int(ymin * meta_h / 1000)
+                        bw = int((xmax - xmin) * meta_w / 1000)
+                        bh = int((ymax - ymin) * meta_h / 1000)
                     else:
-                        box_y = int(meta_h * 0.881)
-                    box_h = int(meta_h * 0.080)
-                    box_w = int(meta_w * 0.85)
-                    box_x = int((meta_w - box_w) / 2)
-                    patch_color = getattr(self.config, 'overlay_patch_color', '0x000000')
-
-                split_items = _split_into_single_sentence_segments(raw, meta_dur)
-                if split_items and split_items[0][0] <= 1.5:
-                    f_start, f_end, f_txt = split_items[0]
-                    split_items[0] = (0.00, f_end, f_txt)
-                for i in range(len(split_items) - 1):
-                    c_s, c_e, c_t = split_items[i]
-                    n_s, n_e, n_t = split_items[i+1]
-                    if 0 < (n_s - c_e) <= 1.2:
-                        split_items[i] = (c_s, n_s, c_t)
-                for i in range(len(split_items)):
-                    c_s, c_e, c_t = split_items[i]
-                    if 4.0 <= c_e < 5.10:
-                        c_e = 5.10
-                    if 4.8 <= c_s < 5.10:
-                        c_s = 5.10
-                        c_e = max(c_e, 6.0)
-                    if c_e <= c_s:
-                        c_e = c_s + 0.8
-                    split_items[i] = (c_s, c_e, c_t)
-                for i, (start, end, txt) in enumerate(split_items, 1):
-                    if txt:
-                        bbox = BoundingBox(box_x, box_y, box_w, box_h, patch_color=patch_color)
-                        segments.append(SubtitleSegment(i, start, min(end, meta_dur), txt, bbox=bbox, ocr_confidence=1.0))
+                        bx = int(meta_w * 0.075)
+                        bw = int(meta_w * 0.85)
+                        by = int(meta_h * 0.881)
+                        bh = int(meta_h * 0.080)
+                    bbox = BoundingBox(bx, by, bw, bh, patch_color=patch_color)
+                    segments.append(SubtitleSegment(i, start, min(end, meta_dur), txt, bbox=bbox, ocr_confidence=1.0))
                 return segments
             finally:
                 try:
@@ -379,8 +363,19 @@ def extract_burned(video, metadata, config, provider=None):
             agent_segs = detector.detect_subtitles(video, metadata)
             if agent_segs:
                 return agent_segs
+            if config.ocr_provider == 'groq':
+                raise RuntimeError('Groq vision found no readable subtitle cards')
         except Exception as exc:
-            logging.getLogger(__name__).warning('AgentCardDetector failed, falling back to Gemini OCR: %s', exc)
+            fallback = 'Groq vision fallback disabled' if config.ocr_provider == 'groq' else 'falling back to Gemini OCR'
+            logging.getLogger(__name__).warning('AgentCardDetector failed, %s: %s', fallback, exc)
+            if config.ocr_provider == 'groq':
+                raise RuntimeError(f'Groq vision card detection failed: {exc}') from exc
+    if config.ocr_provider == 'groq':
+        from pipeline.agent_card_detector import AgentCardDetector
+        segments = AgentCardDetector(config).detect_subtitles(video, metadata)
+        if not segments:
+            raise RuntimeError('Groq vision found no readable subtitle cards')
+        return segments
     if config.ocr_provider == 'gemini':
         try:
             extractor = GeminiVideoSubtitleExtractor(config)
@@ -390,7 +385,7 @@ def extract_burned(video, metadata, config, provider=None):
         except Exception as exc:
             logging.getLogger(__name__).warning('GeminiVideoSubtitleExtractor failed, falling back to Tesseract: %s', exc)
     if provider is None:
-        if config.ocr_provider not in ('tesseract', 'gemini'): raise ValueError('Unsupported OCR_PROVIDER; implement OCRProvider for another engine')
+        if config.ocr_provider not in ('tesseract', 'gemini', 'groq'): raise ValueError('Unsupported OCR_PROVIDER; implement OCRProvider for another engine')
         provider=TesseractOCRProvider(config.ocr_language)
     region=(0,0,metadata.width,metadata.height)
     if config.ocr_region:
@@ -521,7 +516,9 @@ class OverlayRemoval(SubtitleRemoval):
 
 class InpaintingRemoval(SubtitleRemoval):
     def remove_original_subtitle(self, bbox, time_range):
-        raise NotImplementedError('Video inpainting is not implemented. Set REMOVAL_MODE=overlay; original text is only covered, not reconstructed.')
+        # Video inpainting is performed frame-by-frame by subtitle_renderer, where
+        # the timed mask and optional tracked coordinates are available.
+        return None
 
 class DelogoRemoval(SubtitleRemoval):
     def remove_original_subtitle(self, bbox, time_range):

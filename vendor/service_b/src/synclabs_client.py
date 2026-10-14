@@ -3,13 +3,13 @@ import os
 import time
 from pathlib import Path
 import requests
-from .common import PipelineError
+from .common import PipelineError, request_with_retry
 
 
 class SyncLabsClient:
     """
     Client for Sync Labs API (https://api.sync.so).
-    Supports asset uploading via presigned URLs, lipsync-2-pro generation, polling, and downloading.
+    Supports asset uploading via presigned URLs, lipsync-2 generation, polling, and downloading.
     """
 
     def __init__(self, api_key=None, base_url="https://api.sync.so", default_model=None):
@@ -18,7 +18,7 @@ class SyncLabsClient:
             raise PipelineError("Set SYNC_API_KEY in .env or your environment.")
         self.base_url = base_url.rstrip("/")
         self.headers = {"x-api-key": self.api_key}
-        self.default_model = default_model or os.environ.get("SYNC_MODEL", "lipsync-2-pro")
+        self.default_model = default_model or os.environ.get("SYNC_MODEL", "lipsync-2")
 
     def upload_file(self, file_path, content_type=None):
         """
@@ -55,13 +55,15 @@ class SyncLabsClient:
             "size": file_size
         }
         try:
-            r1 = requests.post(
+            r1 = request_with_retry(
+                "POST",
                 req_url,
                 headers={**self.headers, "Content-Type": "application/json"},
                 json=req_body,
-                timeout=30
+                timeout=30,
+                log_prefix="[SyncLabs Upload Init]",
             )
-        except requests.RequestException as e:
+        except Exception as e:
             raise PipelineError(f"Failed to request presigned upload URL from Sync Labs: {e}") from None
 
         if r1.status_code not in (200, 201):
@@ -77,13 +79,15 @@ class SyncLabsClient:
         # Step 2: PUT file bytes to presigned URL (without API key)
         try:
             with open(file_path, "rb") as f:
-                r2 = requests.put(
+                r2 = request_with_retry(
+                    "PUT",
                     upload_url,
                     headers={"Content-Type": content_type},
                     data=f,
-                    timeout=300
+                    timeout=300,
+                    log_prefix="[SyncLabs S3 PUT]",
                 )
-        except requests.RequestException as e:
+        except Exception as e:
             raise PipelineError(f"Failed to upload file bytes to Sync Labs storage: {e}") from None
 
         if r2.status_code not in (200, 201, 204):
@@ -93,13 +97,15 @@ class SyncLabsClient:
         reg_url = f"{self.base_url}/v2/assets"
         asset_type = "VIDEO" if content_type.startswith("video") else ("IMAGE" if content_type.startswith("image") else "AUDIO")
         try:
-            r3 = requests.post(
+            r3 = request_with_retry(
+                "POST",
                 reg_url,
                 headers={**self.headers, "Content-Type": "application/json"},
                 json={"url": canonical_url, "type": asset_type},
-                timeout=30
+                timeout=30,
+                log_prefix="[SyncLabs Asset Register]",
             )
-        except requests.RequestException as e:
+        except Exception as e:
             raise PipelineError(f"Failed to register asset with Sync Labs: {e}") from None
 
         if r3.status_code not in (200, 201):
@@ -109,7 +115,7 @@ class SyncLabsClient:
 
     def generate(self, video_url, audio_url, model=None, options=None):
         """
-        Creates a lip-sync generation using the specified model (defaults to self.default_model, e.g. 'lipsync-2-pro').
+        Creates a lip-sync generation using the specified model (defaults to self.default_model, e.g. 'lipsync-2').
         Returns the generation record containing 'id'.
         """
         model_name = model or self.default_model
@@ -130,13 +136,15 @@ class SyncLabsClient:
         payload["options"] = default_options
 
         try:
-            resp = requests.post(
+            resp = request_with_retry(
+                "POST",
                 url,
                 headers={**self.headers, "Content-Type": "application/json"},
                 json=payload,
-                timeout=30
+                timeout=30,
+                log_prefix="[SyncLabs Generate]",
             )
-        except requests.RequestException as e:
+        except Exception as e:
             raise PipelineError(f"Failed to submit generation to Sync Labs: {e}") from None
 
         if resp.status_code not in (200, 201):
@@ -165,8 +173,8 @@ class SyncLabsClient:
         """
         url = f"{self.base_url}/v2/generate/{generation_id}"
         try:
-            resp = requests.get(url, headers=self.headers, timeout=30)
-        except requests.RequestException as e:
+            resp = request_with_retry("GET", url, headers=self.headers, timeout=30, log_prefix="[SyncLabs Status]")
+        except Exception as e:
             raise PipelineError(f"Failed to get Sync Labs generation status: {e}") from None
 
         if resp.status_code != 200:
@@ -211,14 +219,14 @@ class SyncLabsClient:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            with requests.get(output_url, stream=True, timeout=120) as resp:
+            with request_with_retry("GET", output_url, stream=True, timeout=120, log_prefix="[SyncLabs Download]") as resp:
                 if resp.status_code != 200:
                     raise PipelineError(f"Failed to download Sync Labs video: HTTP {resp.status_code}")
                 with open(output_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
-        except requests.RequestException as e:
+        except Exception as e:
             raise PipelineError(f"Network error downloading Sync Labs video: {e}") from None
 
         if not output_path.exists() or output_path.stat().st_size == 0:

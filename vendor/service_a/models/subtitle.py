@@ -35,3 +35,11 @@ class SubtitleSegment:
     event_index: int | None = None
     fit_width: float | None = None
     fit_height: float | None = None
+    # [(seconds, x, y, width, height)] samples from the per-frame card tracker.
+    bbox_track: list[tuple[float, int, int, int, int]] | None = None
+    # "linear" follows smooth motion; "step" changes position at shot boundaries.
+    bbox_track_mode: str = 'linear'
+    # Preserve deliberate frame-cadence overlap during gap normalization.
+    timing_guarded: bool = False
+    # (x, y, width, height) fractions relative to the card box, for motion tracking.
+    line_regions: list[tuple[float, float, float, float]] | None = None

@@ -11,6 +11,7 @@ Uses:
   - Mouth motion score to separate speaking vs posed shots
 """
 import json
+import os
 import cv2
 import numpy as np
 import subprocess
@@ -27,6 +28,11 @@ SFACE_PATH = SERVICE_ROOT / "models" / "face_recognition_sface_2021dec.onnx"
 AROLL_THRESHOLD = 0.70   # SFace cosine similarity ≥ this → target speaker present
 REJECT_THRESHOLD = 0.40  # Below this → definitely not the target speaker
 MOTION_THRESHOLD = 4.0   # Mouth motion score above this → speaker is talking
+MAX_HEAD_YAW_DEG = float(os.getenv('LIPSYNC_MAX_HEAD_YAW_DEG', '16'))
+MAX_HEAD_PITCH_DEG = float(os.getenv('LIPSYNC_MAX_HEAD_PITCH_DEG', '20'))
+MAX_HEAD_PITCH_DELTA_DEG = float(os.getenv('LIPSYNC_MAX_HEAD_PITCH_DELTA_DEG', '15'))
+MAX_AWAY_FACE_RATIO = float(os.getenv('LIPSYNC_MAX_AWAY_FACE_RATIO', '0.4'))
+CLASSIFY_WINDOW_SEC = float(os.getenv('LIPSYNC_CLASSIFY_WINDOW_SEC', '0.5'))
 
 
 class SceneClassifier:
@@ -50,6 +56,7 @@ class SceneClassifier:
             except Exception as exc:
                 print(f"[Classifier] Model load warning ({exc}) — falling back to motion-only classification.")
         self.anchor_embedding = None
+        self.anchor_angles = None
 
     # ------------------------------------------------------------------
     # Anchor setup
@@ -75,8 +82,9 @@ class SceneClassifier:
             probe_times = [target_time, target_time + 0.5, target_time - 0.5]
         else:
             dur = total / fps
-            probe_times = [dur * 0.2, dur * 0.35, dur * 0.5, dur * 0.65]
+            probe_times = [dur * fraction for fraction in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)]
 
+        candidates = []
         for t in probe_times:
             if t < 0:
                 continue
@@ -105,13 +113,21 @@ class SceneClassifier:
                 selected = max(faces, key=lambda f: f[2] * f[3])
 
             aligned = self.recognizer.alignCrop(frame, selected)
-            self.anchor_embedding = self.recognizer.feature(aligned)
+            embedding = self.recognizer.feature(aligned)
             box = [int(v) for v in selected[:4]]
-            cap.release()
-            print(f"[Classifier] Anchor set from t={t:.2f}s, face box={box}")
-            return box
+            angles = self._head_angles(frame, selected)
+            pose_cost = abs(angles[0]) + abs(angles[1]) if angles else 180.0
+            area = float(selected[2] * selected[3])
+            candidates.append((pose_cost, -area, t, embedding, box, angles))
 
         cap.release()
+        if candidates:
+            _, _, t, embedding, box, angles = min(candidates, key=lambda item: (item[0], item[1]))
+            self.anchor_embedding = embedding
+            self.anchor_angles = angles
+            pose_text = f", head pose={angles[0]:.0f}/{angles[1]:.0f} deg" if angles else ""
+            print(f"[Classifier] Camera-facing anchor set from t={t:.2f}s{pose_text}, face box={box}")
+            return box
         print("[Classifier] Warning: could not set identity anchor — will classify by motion only.")
         return None
 
@@ -130,6 +146,7 @@ class SceneClassifier:
         selected = max(faces, key=lambda f: f[2] * f[3])
         aligned = self.recognizer.alignCrop(frame, selected)
         self.anchor_embedding = self.recognizer.feature(aligned)
+        self.anchor_angles = self._head_angles(frame, selected)
         print(f"[Classifier] Anchor set from reference image: {image_path.name}")
 
     # ------------------------------------------------------------------
@@ -141,6 +158,36 @@ class SceneClassifier:
         return float(self.recognizer.match(
             self.anchor_embedding, embedding, cv2.FaceRecognizerSF_FR_COSINE
         ))
+
+    @staticmethod
+    def _head_angles(frame: np.ndarray, face: np.ndarray) -> tuple[float, float] | None:
+        """Estimate head yaw/pitch from YuNet's five facial landmarks."""
+        try:
+            h, w = frame.shape[:2]
+            # YuNet order: subject's right eye, left eye, nose, right mouth, left mouth.
+            image_points = np.asarray(face[4:14], dtype=np.float64).reshape(5, 2)
+            model_points = np.asarray([
+                [-30.0,  30.0, -30.0], [30.0,  30.0, -30.0],
+                [  0.0,   0.0,   0.0], [-25.0, -30.0, -20.0],
+                [ 25.0, -30.0, -20.0],
+            ], dtype=np.float64)
+            focal = float(max(w, h))
+            camera = np.asarray([[focal, 0, w / 2], [0, focal, h / 2], [0, 0, 1]], dtype=np.float64)
+            ok, rotation, _ = cv2.solvePnP(
+                model_points, image_points, camera, np.zeros((4, 1)), flags=cv2.SOLVEPNP_SQPNP
+            )
+            if not ok:
+                return None
+            matrix, _ = cv2.Rodrigues(rotation)
+            forward = matrix @ np.asarray([0.0, 0.0, 1.0])
+            # A front-facing model can point along either +/- Z depending on the
+            # landmark convention; absolute Z keeps frontal pose near zero yaw.
+            depth = abs(forward[2])
+            yaw = np.degrees(np.arctan2(forward[0], depth))
+            pitch = np.degrees(np.arctan2(forward[1], depth))
+            return float(yaw), float(pitch)
+        except (cv2.error, ValueError, TypeError):
+            return None
 
     def _sample_frames(self, video_path: Path, start_s: float, end_s: float,
                         n_samples: int = 8) -> list[np.ndarray]:
@@ -159,18 +206,66 @@ class SceneClassifier:
         return frames
 
     def _mouth_motion_score(self, frames: list[np.ndarray]) -> float:
-        """Estimate mouth region motion via frame-diff in lower-face region."""
+        """Estimate mouth region motion relative to detected face bounding boxes."""
         if len(frames) < 2:
             return 0.0
+
+        # If face detector is available, crop the actual mouth area from the face
+        if self._has_models and self.detector is not None:
+            mouth_crops = []
+            for frame in frames:
+                h, w = frame.shape[:2]
+                self.detector.setInputSize((w, h))
+                _, faces = self.detector.detect(frame)
+                if faces is not None and len(faces) > 0:
+                    face = max(faces, key=lambda f: f[2] * f[3])
+                    fx, fy, fw, fh = face[:4]
+                    # Mouth region inside the face bounding box
+                    mx1 = max(0, int(fx + 0.25 * fw))
+                    mx2 = min(w, int(fx + 0.75 * fw))
+                    my1 = max(0, int(fy + 0.65 * fh))
+                    my2 = min(h, int(fy + 0.95 * fh))
+                    m = frame[my1:my2, mx1:mx2]
+                    if m.size > 0:
+                        m_gray = cv2.resize(cv2.cvtColor(m, cv2.COLOR_BGR2GRAY), (64, 48))
+                        mouth_crops.append(m_gray)
+            if len(mouth_crops) >= 2:
+                scores = []
+                for i in range(1, len(mouth_crops)):
+                    diff = cv2.absdiff(mouth_crops[i - 1].astype(np.float32), mouth_crops[i].astype(np.float32))
+                    scores.append(float(diff.mean()))
+                return float(np.mean(scores)) if scores else 0.0
+
+        # Fallback: lower third of frame if face detector unavailable
         scores = []
         for i in range(1, len(frames)):
             h, w = frames[i].shape[:2]
-            # Lower third of frame (mouth area)
             r1 = cv2.cvtColor(frames[i - 1][h * 2 // 3:, w // 4: w * 3 // 4], cv2.COLOR_BGR2GRAY)
             r2 = cv2.cvtColor(frames[i][h * 2 // 3:, w // 4: w * 3 // 4], cv2.COLOR_BGR2GRAY)
             diff = cv2.absdiff(r1.astype(np.float32), r2.astype(np.float32))
             scores.append(float(diff.mean()))
         return float(np.mean(scores)) if scores else 0.0
+
+    def _jaw_articulation_score(self, frames: list[np.ndarray]) -> float:
+        """Measure variation in jaw opening (mouth-to-nose vertical distance / face height).
+        Real dialogue shows active articulation variance; static smiles or posed looks have near-zero variation."""
+        if not self._has_models or self.detector is None or len(frames) < 3:
+            return 0.05
+        dists = []
+        for frame in frames:
+            h, w = frame.shape[:2]
+            self.detector.setInputSize((w, h))
+            _, faces = self.detector.detect(frame)
+            if faces is not None and len(faces) > 0:
+                face = max(faces, key=lambda f: f[2] * f[3])
+                fh = float(face[3])
+                if fh > 10:
+                    ny = float(face[9])
+                    my = float((face[11] + face[13]) / 2.0)
+                    dists.append((my - ny) / fh)
+        if len(dists) < 3:
+            return 0.05
+        return float(np.std(dists))
 
     def classify_shot(self, video_path: Path, start_s: float, end_s: float,
                        speech_intervals: list[tuple] = None) -> dict:
@@ -200,19 +295,20 @@ class SceneClassifier:
         motion = self._mouth_motion_score(frames)
 
         if not self._has_models or self.anchor_embedding is None:
-            # Fallback: classify by motion only
-            label = "A_ROLL" if motion >= MOTION_THRESHOLD else "B_ROLL"
             return {
-                "class": label,
+                "class": "B_ROLL",
                 "similarity": -1.0,
                 "motion": round(motion, 2),
                 "face_coords": None,
-                "reason": f"Motion-only: score={motion:.2f}",
+                "camera_facing": None,
+                "reason": "Face identity/head-pose models unavailable; skipping lip-sync",
             }
 
         # Deep face identity check
         best_sim = -1.0
         best_coords = None
+        pose_count = 0
+        away_count = 0
         for frame in frames:
             h, w = frame.shape[:2]
             self.detector.setInputSize((w, h))
@@ -223,13 +319,39 @@ class SceneClassifier:
                 aligned = self.recognizer.alignCrop(frame, face)
                 emb = self.recognizer.feature(aligned)
                 sim = self._similarity(emb)
+                # Pose is useful even when an angled/downward face weakens the
+                # identity embedding, so collect it at the lower reject boundary.
+                if sim >= REJECT_THRESHOLD:
+                    angles = self._head_angles(frame, face)
+                    if angles is not None:
+                        pose_count += 1
+                        yaw, pitch = angles
+                        yaw_off = abs(yaw) > MAX_HEAD_YAW_DEG
+                        if self.anchor_angles is not None:
+                            yaw_off = yaw_off or abs(yaw - self.anchor_angles[0]) > MAX_HEAD_YAW_DEG
+                            pitch_off = abs(pitch - self.anchor_angles[1]) > MAX_HEAD_PITCH_DELTA_DEG
+                        else:
+                            pitch_off = abs(pitch) > MAX_HEAD_PITCH_DEG
+                        if yaw_off or pitch_off:
+                            away_count += 1
                 if sim > best_sim:
                     best_sim = sim
                     best_coords = [int(v) for v in face[:4]]
 
-        if best_sim >= AROLL_THRESHOLD and motion >= MOTION_THRESHOLD:
+        jaw_std = self._jaw_articulation_score(frames)
+
+        away_ratio = away_count / pose_count if pose_count else 0.0
+        if best_sim >= AROLL_THRESHOLD and pose_count and away_ratio > MAX_AWAY_FACE_RATIO:
+            label = "B_ROLL"
+            reason = (f"Target head is off-axis in {away_ratio:.0%} of samples; "
+                      "skipping lip-sync while the speaker looks away")
+        elif best_sim >= AROLL_THRESHOLD and motion >= MOTION_THRESHOLD and jaw_std < 0.014:
+            # Motion was detected (hands/towel moving), but jaw opening is static (smile/posing)
+            label = "B_ROLL"
+            reason = f"Target face holding static expression/smile (jaw articulation std={jaw_std:.4f})"
+        elif best_sim >= AROLL_THRESHOLD and motion >= MOTION_THRESHOLD:
             label = "A_ROLL"
-            reason = f"Target speaker confirmed (sim={best_sim:.2f}, motion={motion:.2f})"
+            reason = f"Target speaker confirmed (sim={best_sim:.2f}, motion={motion:.2f}, jaw_std={jaw_std:.4f})"
         elif best_sim >= AROLL_THRESHOLD:
             # Face present but not talking (posed/listening shot)
             label = "B_ROLL"
@@ -246,6 +368,8 @@ class SceneClassifier:
             "similarity": round(best_sim, 3),
             "motion": round(motion, 2),
             "face_coords": best_coords,
+            "camera_facing": (away_ratio <= MAX_AWAY_FACE_RATIO) if pose_count else None,
+            "head_away_ratio": round(away_ratio, 3),
             "reason": reason,
         }
 
@@ -266,9 +390,21 @@ class SceneClassifier:
         for i, scene in enumerate(scenes):
             start_s = scene["start"]
             end_s = scene["end"]
-            result = self.classify_shot(video_path, start_s, end_s, speech_intervals)
-            enriched = {**scene, **result}
-            results.append(enriched)
+            window = max(0.25, CLASSIFY_WINDOW_SEC)
+            t = start_s
+            while t < end_s - 1e-4:
+                window_end = min(end_s, t + window)
+                result = self.classify_shot(video_path, t, window_end, speech_intervals)
+                enriched = {**scene, "start": t, "end": window_end, **result}
+                if results and results[-1]["class"] == enriched["class"] and abs(results[-1]["end"] - t) < 0.02:
+                    results[-1]["end"] = window_end
+                    old_ratio = results[-1].get("head_away_ratio")
+                    new_ratio = enriched.get("head_away_ratio")
+                    if old_ratio is not None and new_ratio is not None:
+                        results[-1]["head_away_ratio"] = round((old_ratio + new_ratio) / 2, 3)
+                else:
+                    results.append(enriched)
+                t = window_end
             print(f"[Classifier] Shot {i:02d} [{start_s:.2f}s-{end_s:.2f}s] → "
                   f"{result['class']} | {result['reason']}")
         return results

@@ -11,6 +11,8 @@
     h1 { margin:0 0 6px } p { color:#b6c1ce }
     form { display:grid; gap:16px; margin-top:24px }
     label { display:grid; gap:6px; font-weight:600 }
+    label.checkbox { display:flex; align-items:flex-start; gap:10px; font-weight:500 }
+    label.checkbox input { width:18px; height:18px; margin-top:3px; padding:0; flex:0 0 auto }
     input,select,button { font:inherit; border-radius:8px; border:1px solid #485568; padding:11px 12px; color:inherit; background:#131922 }
     .actions { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px }
     button { cursor:pointer; border:0; background:#56c2a5; color:#09251e; font-weight:700 }
@@ -26,12 +28,16 @@
 <body>
 <main>
   <h1>Directory Language Studio</h1>
-  <p>Choose whether to run Masking, Dubbing, or Combine.</p>
+  <p>Choose Masking, Dubbing, or Combine. Dubbing jobs pause for source transcript and translated text review before generating audio.</p>
   <form id="submit-form">
     <label>Video<input name="file" type="file" accept="video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm" required></label>
     <label>Target language<select name="target_language" id="target" required></select></label>
     <label>Spoken source language code<input name="source_language" value="auto" placeholder="auto, en, hi…"></label>
-    <small>Masking runs Service A. Dubbing runs Service B. Combine runs masking first, then dubbing, and produces one combined video.</small>
+    <label class="checkbox">
+      <input name="add_auto_captions" type="checkbox" value="true">
+      <span>Add translated captions to the dubbed video<br><small>For captionless source videos. Shows 4–5 words at a time, keeps names and ingredients in English, follows the dubbed audio, and uses a fitted opaque black background.</small></span>
+    </label>
+    <small>Masking runs Service A. Dubbing runs Service B. Combine runs dubbing first, then visual translation, and produces one combined video.</small>
     <div class="actions">
       <button type="submit" name="operation" value="masking" class="secondary">Masking</button>
       <button type="submit" name="operation" value="dubbing" class="secondary">Dubbing</button>
@@ -44,6 +50,7 @@
 const form = document.querySelector('#submit-form');
 const result = document.querySelector('#result');
 const buttons = [...form.querySelectorAll('button[type="submit"]')];
+const activeJobKey = 'directory-language-active-job';
 fetch('/api/languages').then(r => r.json()).then(items => {
   for (const item of items) {
     const option = document.createElement('option');
@@ -51,6 +58,79 @@ fetch('/api/languages').then(r => r.json()).then(items => {
     document.querySelector('#target').append(option);
   }
 });
+async function pollJob(jobId) {
+  const statusResponse = await fetch(`/api/jobs/${jobId}`);
+  const job = await statusResponse.json();
+  result.replaceChildren();
+  const heading = document.createElement('p');
+  heading.textContent = `${job.operation}: ${job.status} · ${job.stage}`;
+  result.append(heading);
+  const logLink = document.createElement('a'); logLink.href = job.log_url; logLink.textContent = 'View complete process log'; result.append(logLink);
+  if (job.error) { const error = document.createElement('p'); error.textContent = job.error; result.append(error); }
+  if (job.status === 'review_required') {
+    const reviewResponse = await fetch(job.review_url);
+    const review = await reviewResponse.json();
+    if (!reviewResponse.ok) throw new Error(review.detail || 'Could not load review text');
+    const sourceStage = review.stage === 'source_transcript_review';
+    const prompt = document.createElement('p');
+    prompt.textContent = sourceStage
+      ? 'Review and correct what was spoken in the source video. Confirming this transcript creates the translation for the next review.'
+      : 'Review and correct the translation. Confirming it starts audio generation and lip sync.';
+    result.append(prompt);
+    if (review.report) {
+      const audit = document.createElement('section');
+      const title = document.createElement('h3'); title.textContent = 'AI review'; audit.append(title);
+      const summary = document.createElement('p'); summary.textContent = review.report.summary || 'No summary returned.'; audit.append(summary);
+      if (sourceStage) { const limit = document.createElement('small'); limit.textContent = 'This automated check reviews transcript text for likely defects; it cannot compare words with the audio. Listen to the source while reviewing.'; audit.append(limit); }
+      for (const issue of review.report.issues || []) {
+        const item = document.createElement('p');
+        item.textContent = `Cue ${issue.cue_id ?? '?'} · ${issue.severity || 'note'}: ${issue.reason || ''}${issue.suggestion ? ` Suggested: ${issue.suggestion}` : ''}`;
+        audit.append(item);
+      }
+      result.append(audit);
+    }
+    const sourcePreview = document.createElement('video');
+    sourcePreview.controls = true; sourcePreview.src = job.input_url;
+    result.append(sourcePreview);
+    const editor = document.createElement('textarea');
+    editor.rows = 16; editor.style.width = '100%'; editor.style.boxSizing = 'border-box';
+    editor.style.fontFamily = 'ui-monospace, monospace'; editor.value = review.text;
+    result.append(editor);
+    const confirm = document.createElement('button'); confirm.type = 'button';
+    confirm.textContent = sourceStage ? 'Confirm source transcript' : 'Confirm translation and continue';
+    confirm.addEventListener('click', async () => {
+      confirm.disabled = true;
+      try {
+        const response = await fetch(job.review_url, {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({text: editor.value}),
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.detail || 'Could not save review');
+        pollJob(jobId);
+      } catch (error) { confirm.disabled = false; alert(error.message); }
+    });
+    result.append(confirm);
+    return;
+  }
+  if (job.status === 'completed') {
+    localStorage.removeItem(activeJobKey);
+    const links = document.createElement('div'); links.className = 'links';
+    const labels = {final_video:'Processed video',captioned_video:'Captioned dubbed video',visual_subtitles:'Visual subtitles',audio_subtitles:'Audio subtitles',source_transcript:'Approved source transcript',target_translation:'Approved translation',masking_video:'Masking video',dubbed_video:'Dubbed video',service_a_video:'Service A video',service_b_video:'Service B video',service_b_audio:'Dubbed audio'};
+    for (const [name, url] of Object.entries(job.artifacts)) {
+      const link = document.createElement('a'); link.href = url; link.textContent = labels[name] || name.replaceAll('_',' '); link.download = ''; links.append(link);
+    }
+    const manifest = document.createElement('a'); manifest.href = job.manifest_url; manifest.textContent = 'job manifest'; links.append(manifest);
+    result.append(links);
+    const video = document.createElement('video'); video.controls = true; video.src = job.artifacts.final_video; result.append(video);
+    buttons.forEach(button => button.disabled = false); return;
+  }
+  if (job.status === 'failed' || job.status === 'cancelled') {
+    localStorage.removeItem(activeJobKey); buttons.forEach(button => button.disabled = false); return;
+  }
+  setTimeout(() => pollJob(jobId).catch(error => { result.textContent = error.message; }), 2500);
+}
+
 form.addEventListener('submit', async event => {
   event.preventDefault();
   if (!form.reportValidity()) return;
@@ -63,33 +143,16 @@ form.addEventListener('submit', async event => {
     const response = await fetch('/api/jobs', {method:'POST', body:formData});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Upload failed');
-    result.textContent = `Job ${data.job_id}: queued`;
-    const poll = async () => {
-      const statusResponse = await fetch(data.status_url);
-      const job = await statusResponse.json();
-      result.replaceChildren();
-      const heading = document.createElement('p');
-      heading.textContent = `${job.operation}: ${job.status} · ${job.stage}`;
-      result.append(heading);
-      const logLink = document.createElement('a'); logLink.href = job.log_url; logLink.textContent = 'View complete process log'; result.append(logLink);
-      if (job.error) { const error = document.createElement('p'); error.textContent = job.error; result.append(error); }
-      if (job.status === 'completed') {
-        const links = document.createElement('div'); links.className = 'links';
-        const labels = {final_video:'Processed video',visual_subtitles:'Visual subtitles',audio_subtitles:'Audio subtitles',masking_video:'Masking video',dubbed_video:'Dubbed video',service_a_video:'Service A video',service_b_video:'Service B video',service_b_audio:'Dubbed audio'};
-        for (const [name, url] of Object.entries(job.artifacts)) {
-          const link = document.createElement('a'); link.href = url; link.textContent = labels[name] || name.replaceAll('_',' '); link.download = ''; links.append(link);
-        }
-        const manifest = document.createElement('a'); manifest.href = job.manifest_url; manifest.textContent = 'job manifest'; links.append(manifest);
-        result.append(links);
-        const video = document.createElement('video'); video.controls = true; video.src = job.artifacts.final_video; result.append(video);
-        buttons.forEach(button => button.disabled = false); return;
-      }
-      if (job.status === 'failed') { buttons.forEach(button => button.disabled = false); return; }
-      setTimeout(poll, 2500);
-    };
-    poll();
+    localStorage.setItem(activeJobKey, data.job_id);
+    await pollJob(data.job_id);
   } catch (error) { result.textContent = error.message; buttons.forEach(button => button.disabled = false); }
 });
+
+const pendingJob = localStorage.getItem(activeJobKey);
+if (pendingJob) {
+  buttons.forEach(button => button.disabled = true);
+  pollJob(pendingJob).catch(error => { localStorage.removeItem(activeJobKey); result.textContent = error.message; buttons.forEach(button => button.disabled = false); });
+}
 </script>
 </body>
 </html>

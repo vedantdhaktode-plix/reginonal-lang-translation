@@ -13,30 +13,34 @@ class Config:
     source_language: str = 'auto'
     translation_provider: str = 'gemini'
     api_key: str = field(default='', repr=False)
-    model: str = ''
+    model: str = 'gemini-3.5-flash-lite'
+    groq_api_key: str = field(default='', repr=False)
+    groq_vision_model: str = 'qwen/qwen3.8-27b'
     gemini_api_key: str = field(default='', repr=False)
-    gemini_model: str = 'gemini-2.5-flash'
+    gemini_model: str = 'gemini-3.5-flash-lite'
     stability_seconds: float = 5
     stability_timeout: float = 600
     max_retries: int = 2
     shortening_retries: int = 2
-    max_lines: int = 2
-    max_chars: int = 42
-    batch_size: int = 30
+    # Three short lines give translations room for language expansion without
+    # forcing the model to omit meaning or making the pipeline truncate a cue.
+    max_lines: int = 3
+    max_chars: int = 54
+    batch_size: int = 12
     api_timeout: float = 120
     command_timeout: float = 7200
     ffmpeg: str = 'ffmpeg'
     ffprobe: str = 'ffprobe'
     ocr_enabled: bool = True
-    ocr_provider: str = 'tesseract'
+    ocr_provider: str = 'gemini'
     ocr_language: str = 'eng'
     ocr_interval: float = 0.25
     ocr_region: str = ''
     ocr_solid_bg_only: bool = False
     ocr_bg_variance_threshold: float = 30.0
     ocr_target_box: str = ''
-    overlay_patch_color: str = '0xF4D9B9'
-    box_text_color: str = '#1F1916'
+    overlay_patch_color: str = '0x000000'
+    box_text_color: str = '#FFFFFF'
     removal_mode: str = 'overlay'
     overlay_patch: bool = True
     font_name: str = ''
@@ -76,8 +80,8 @@ class Config:
             raise ValueError('Invalid limits')
         if not self.target_language.strip() or len(self.target_language) > 80:
             raise ValueError('Provide a target language of 1–80 characters')
-        if self.translation_provider not in ('claude', 'gemini'):
-            raise ValueError("TRANSLATION_PROVIDER must be 'claude' or 'gemini'")
+        if self.translation_provider not in ('claude', 'gemini', 'groq'):
+            raise ValueError("TRANSLATION_PROVIDER must be 'claude', 'gemini', or 'groq'")
         import shutil
         winget_pkgs = Path(os.environ.get('LOCALAPPDATA', '')) / 'Microsoft/WinGet/Packages'
         if not shutil.which(self.ffmpeg) and not Path(self.ffmpeg).is_file() and winget_pkgs.is_dir():
@@ -98,6 +102,8 @@ class Config:
             'translation_provider':('TRANSLATION_PROVIDER',str),
             'api_key':('ANTHROPIC_API_KEY',str),
             'model':('TRANSLATION_MODEL',str),
+            'groq_api_key':('GROQ_API_KEY',str),
+            'groq_vision_model':('GROQ_VISION_MODEL',str),
             'gemini_api_key':('GEMINI_API_KEY',str),
             'gemini_model':('GEMINI_MODEL',str),
             'stability_seconds':('FILE_STABILITY_SECONDS',float),

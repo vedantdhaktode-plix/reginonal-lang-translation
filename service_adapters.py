@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -66,26 +67,6 @@ class LocalSubtitleTranslatorAdapter:
         self.service_root = Path(service_root)
 
     def run(self, video: Artifact, *, target_language: str, source_language: str = "auto", job_id: str) -> dict[str, Artifact]:
-        if hasattr(self.backend, "root"):
-            existing_video = Path(self.backend.root) / "service-a-video.mp4"
-            existing_subtitles = Path(self.backend.root) / "visual-subtitles.srt"
-            if existing_video.is_file() and existing_subtitles.is_file():
-                print(f"[Service A] Found existing artifacts in {self.backend.root}, skipping Service A re-run.")
-                return {
-                    "video": Artifact(
-                        uri="artifact://service-a-video.mp4",
-                        filename="service-a-video.mp4",
-                        content_type="video/mp4",
-                        metadata={"path": str(existing_video)},
-                    ),
-                    "visual_subtitles": Artifact(
-                        uri="artifact://visual-subtitles.srt",
-                        filename="visual-subtitles.srt",
-                        content_type="application/x-subrip",
-                        metadata={"path": str(existing_subtitles)},
-                    ),
-                }
-
         target_name = LANGUAGES.get(target_language.lower(), target_language)
         with _SERVICE_A_LOCK, tempfile.TemporaryDirectory(prefix=f"service-a-{job_id}-") as temp:
             root = Path(temp)
@@ -109,6 +90,12 @@ class LocalSubtitleTranslatorAdapter:
                 "SOURCE_LANGUAGE": source_language,
                 "OCR_PROVIDER": os.getenv("OCR_PROVIDER", "gemini"),
                 "OCR_TARGET_BOX": os.getenv("OCR_TARGET_BOX", "agent"),
+                "TRANSLATION_PROVIDER": os.getenv("TRANSLATION_PROVIDER", "gemini"),
+                "TRANSLATION_MODEL": os.getenv("TRANSLATION_MODEL", "gemini-3.5-flash-lite"),
+                "GROQ_API_KEY": os.getenv("GROQ_API_KEY", ""),
+                "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
+                "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                "GEMINI_VISION_MODEL": os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite"),
             }
             previous = {key: os.environ.get(key) for key in env}
             os.environ.update(env)
@@ -139,14 +126,13 @@ class LocalSubtitleTranslatorAdapter:
                 translated_track = config.processing_dir / created / "translated.ass"
                 if not translated_track.is_file():
                     translated_track = config.processing_dir / created / "translated.srt"
-                if not translated_track.is_file():
-                    raise FileNotFoundError("Service A completed without its translated subtitle track")
                 visual_srt = root / "visual-subtitles.srt"
-                import pysubs2
-                document = pysubs2.load(str(translated_track), encoding="utf-8")
-                if not document.events:
-                    raise ValueError("Service A did not produce any translated visual subtitle cues")
-                document.save(str(visual_srt), format_="srt", encoding="utf-8")
+                if translated_track.is_file():
+                    import pysubs2
+                    document = pysubs2.load(str(translated_track), encoding="utf-8")
+                    document.save(str(visual_srt), format_="srt", encoding="utf-8")
+                else:
+                    visual_srt.write_text("", encoding="utf-8")
                 return {
                     "video": self.backend.upload(completed, filename="service-a-video.mp4", content_type="video/mp4"),
                     "visual_subtitles": self.backend.upload(visual_srt, filename="visual-subtitles.srt", content_type="application/x-subrip"),
@@ -166,7 +152,10 @@ class TextToAudioAdapter:
         self.backend = backend
         self.service_root = Path(service_root)
 
-    def run(self, video: Artifact, *, target_language: str, source_language: str = "auto", job_id: str) -> dict[str, Artifact]:
+    def run(
+        self, video: Artifact, *, target_language: str, source_language: str = "auto", job_id: str,
+        source_transcript: Path | None = None, reviewed_translation: Path | None = None,
+    ) -> dict[str, Artifact]:
         _add_import_root(self.service_root)
         cached = sys.modules.get("src")
         if cached is not None and not Path(cached.__file__).resolve().is_relative_to(self.service_root.resolve()):
@@ -181,7 +170,10 @@ class TextToAudioAdapter:
             target_lang=target_language,
             source_lang=source_language,
             job_dir=root / "job",
+            sync_model="lipsync-2",
             dry_run=os.getenv("DUBBING_DRY_RUN", "false").lower() == "true",
+            supplied_source_transcript=source_transcript,
+            reviewed_translation_srt=reviewed_translation,
         )
         output = Path(output)
         result: dict[str, Artifact] = {
@@ -198,3 +190,63 @@ class TextToAudioAdapter:
                 audio_srt, filename="audio-subtitles.srt", content_type="application/x-subrip"
             )
         return result
+
+
+def prepare_source_transcript(video_path: Path, review_dir: Path, source_language: str) -> Path:
+    """Transcribe, run the AI quality review, and save an editable SRT for approval."""
+    _add_import_root(SERVICE_B_ROOT)
+    cached = sys.modules.get("src")
+    if cached is not None and not Path(cached.__file__).resolve().is_relative_to(SERVICE_B_ROOT.resolve()):
+        raise RuntimeError("A different top-level 'src' package is already loaded; isolate this application process.")
+    common = importlib.import_module("src.common")
+    common.load_env(Path(__file__).resolve().parent / ".env")
+    transcriber = importlib.import_module("src.transcriber")
+    review_dir = Path(review_dir)
+    review_dir.mkdir(parents=True, exist_ok=True)
+    generated, _ = transcriber.extract_transcript(
+        video_path=Path(video_path), job_dir=review_dir / "transcription",
+        source_lang=source_language,
+    )
+    destination = review_dir / "source_transcript.srt"
+    shutil.copy2(generated, destination)
+    verifier = importlib.import_module("src.script_verifier")
+    report = verifier.verify_srt(destination.read_text(encoding="utf-8"), kind="source", source_language=source_language)
+    (review_dir / "source_transcript_ai_review.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return destination
+
+
+def prepare_translation_review(source_srt: Path, target_language: str, source_language: str, review_dir: Path) -> Path:
+    """Translate the approved source cues and save an editable target SRT."""
+    _add_import_root(SERVICE_B_ROOT)
+    cached = sys.modules.get("src")
+    if cached is not None and not Path(cached.__file__).resolve().is_relative_to(SERVICE_B_ROOT.resolve()):
+        raise RuntimeError("A different top-level 'src' package is already loaded; isolate this application process.")
+    common = importlib.import_module("src.common")
+    common.load_env(Path(__file__).resolve().parent / ".env")
+    parser = importlib.import_module("src.srt_parser")
+    dubber = importlib.import_module("src.el_dubber")
+    cues = parser.parse_srt(Path(source_srt).read_text(encoding="utf-8"))
+    translated = dubber.translate_cues(cues, target_language, source_language)
+    destination = Path(review_dir) / "target_translation.srt"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(parser.render_srt([
+        {"start_ms": cue.start_ms, "end_ms": cue.end_ms, "target_text": cue.text}
+        for cue in translated
+    ]), encoding="utf-8")
+    verifier = importlib.import_module("src.script_verifier")
+    report = verifier.verify_srt(
+        destination.read_text(encoding="utf-8"), kind="translation",
+        source_text=Path(source_srt).read_text(encoding="utf-8"),
+        target_language=target_language, source_language=source_language,
+    )
+    (Path(review_dir) / "translation_ai_review.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return destination
+
+
+def validate_review_srt(text: str) -> None:
+    _add_import_root(SERVICE_B_ROOT)
+    cached = sys.modules.get("src")
+    if cached is not None and not Path(cached.__file__).resolve().is_relative_to(SERVICE_B_ROOT.resolve()):
+        raise RuntimeError("A different top-level 'src' package is already loaded; isolate this application process.")
+    parser = importlib.import_module("src.srt_parser")
+    parser.parse_srt(text)

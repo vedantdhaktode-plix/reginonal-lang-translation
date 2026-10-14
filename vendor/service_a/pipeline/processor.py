@@ -14,7 +14,7 @@ from pipeline.video_analyzer import analyze
 from pipeline.subtitle_detector import detect
 from pipeline.subtitle_extractor import extract
 from pipeline.burned_subtitle_ocr import extract_burned
-from pipeline.translator import ClaudeTranslationProvider, GeminiTranslationProvider, translate, detect_source_language
+from pipeline.translator import ClaudeTranslationProvider, GeminiTranslationProvider, GroqTranslationProvider, translate, detect_source_language
 from pipeline.subtitle_style import assign_styles, generate
 from pipeline.subtitle_renderer import render
 from pipeline.ffmpeg_utils import output_filename
@@ -218,6 +218,21 @@ def update_segment_boxes(segments, metadata, config):
     meta_w = getattr(metadata, 'width', 1080)
     meta_h = getattr(metadata, 'height', 1080)
 
+    def clamp_box(box):
+        """Return valid integer geometry fully contained by the video frame."""
+        width = max(1, min(meta_w, int(round(box.width))))
+        height = max(1, min(meta_h, int(round(box.height))))
+        x = max(0, min(meta_w - width, int(round(box.x))))
+        y = max(0, min(meta_h - height, int(round(box.y))))
+        return BoundingBox(x, y, width, height, patch_color=box.patch_color)
+
+    # Detector samples can legitimately come from different shots.  A maximum
+    # width/height combined with a position from another shot may cross an edge,
+    # so normalize source geometry before it is used for layout decisions.
+    for segment in segments:
+        if segment.bbox:
+            segment.bbox = clamp_box(segment.bbox)
+
     # Detect baseline container position and color from incoming segments if available
     detected_box = next((s.bbox for s in segments if s.bbox and s.bbox.height > 0), None)
     if detected_box:
@@ -232,6 +247,10 @@ def update_segment_boxes(segments, metadata, config):
     is_pill = getattr(config, 'pill_mode', False)
 
     for s in segments:
+        # Keep source geometry intact when the renderer has separate, tight line
+        # masks. Expanding the card box here would collapse the preserved gaps.
+        if s.line_regions:
+            continue
         cur_y = s.bbox.y if (s.bbox and s.bbox.height > 0) else default_y
         cur_h = s.bbox.height if (s.bbox and s.bbox.height > 0) else default_h
         cur_color = (s.bbox.patch_color if (s.bbox and s.bbox.patch_color) else default_color)
@@ -246,16 +265,23 @@ def update_segment_boxes(segments, metadata, config):
             # fits translated text inside this area; moving it to frame center can
             # expose source text when the original card is off-center.
             source_box = s.bbox
-            pad_x = max(8, int(cur_h * 0.15))
-            pad_y = max(4, int(cur_h * 0.08))
-            source_x = source_box.x if source_box and source_box.width > 0 else int((meta_w - min(meta_w * 0.85, max(440, tw + 120))) / 2)
-            source_w = source_box.width if source_box and source_box.width > 0 else min(int(meta_w * 0.85), max(440, int(tw + 120)))
-            bx = max(0, source_x - pad_x)
-            right = min(meta_w, source_x + source_w + pad_x)
-            bw = right - bx
-            bh = min(meta_h, max(cur_h, 1) + 2 * pad_y)
-            by = max(0, min(meta_h - bh, cur_y - pad_y))
-            s.bbox = BoundingBox(bx, by, bw, bh, patch_color=cur_color)
+            if source_box and source_box.width > 0 and source_box.height > 0:
+                # Tracker and agent boxes already include background margin. Do
+                # not expand them again: bbox_track contains the original geometry,
+                # and double padding makes the replacement spill outside the card.
+                s.bbox = BoundingBox(source_box.x, source_box.y, source_box.width,
+                                     source_box.height, patch_color=cur_color)
+            else:
+                pad_x = max(8, int(cur_h * 0.15))
+                pad_y = max(4, int(cur_h * 0.08))
+                source_w = min(int(meta_w * 0.85), max(440, int(tw + 120)))
+                source_x = int((meta_w - source_w) / 2)
+                bx = max(0, source_x - pad_x)
+                right = min(meta_w, source_x + source_w + pad_x)
+                bw = right - bx
+                bh = min(meta_h, max(cur_h, 1) + 2 * pad_y)
+                by = max(0, min(meta_h - bh, cur_y - pad_y))
+                s.bbox = BoundingBox(bx, by, bw, bh, patch_color=cur_color)
         else:
             if s.bbox and s.bbox.width > 0 and s.bbox.height > 0:
                 if s.bbox.y > meta_h * 0.4:
@@ -264,6 +290,23 @@ def update_segment_boxes(segments, metadata, config):
             bw = min(int(meta_w * 0.85), max(440, int(tw + 120)))
             bx = int((meta_w - bw) / 2)
             s.bbox = BoundingBox(bx, cur_y, bw, cur_h, patch_color=cur_color)
+    # FFmpeg clips an oversized overlay without reporting an error, but QC must
+    # receive the same in-frame geometry that was actually intended.  Track
+    # widths are metadata only; the rendered PNG uses the final base-box size.
+    for segment in segments:
+        if not segment.bbox:
+            continue
+        segment.bbox = clamp_box(segment.bbox)
+        if segment.bbox_track:
+            render_w = segment.bbox.width
+            render_h = segment.bbox.height
+            clamped_track = []
+            for point in segment.bbox_track:
+                timestamp, x, y, _width, _height = point
+                track_x = max(0, min(meta_w - render_w, int(round(x))))
+                track_y = max(0, min(meta_h - render_h, int(round(y))))
+                clamped_track.append((timestamp, track_x, track_y, render_w, render_h))
+            segment.bbox_track = clamped_track
     return segments
 
 def export_and_review_script(segments, job, config):
@@ -382,17 +425,23 @@ class Processor:
                 segments,document=self.stage(job,'EXTRACTING_SUBTITLES',lambda:extract(video,track,folder,config))
             else:
                 segments=self.stage(job,'OCR',lambda:extract_burned(video,metadata,config)); document=None
+            if not segments:
+                destination=config.completed_dir/output_filename(job.filename,job.target_language)
+                shutil.copy2(video, destination)
+                self.db.update(job.job_id,'COMPLETED',output_path=str(destination),error_message=None)
+                return True
             detected_src = detect_source_language(segments, job.source_language, track)
             if detected_src and (not job.source_language or job.source_language.lower() in ('auto', 'und', 'unknown')):
                 job.source_language = detected_src
                 try: self.db.update(job.job_id, source_language=detected_src)
                 except Exception: pass
-            originals=copy.deepcopy(segments)
             self.stage(job,'STYLE_ANALYSIS',lambda:assign_styles(segments,metadata,config,document))
             def translation():
                 if self.provider is None:
                     if config.translation_provider == 'gemini':
                         self.provider = GeminiTranslationProvider(config)
+                    elif config.translation_provider == 'groq':
+                        self.provider = GroqTranslationProvider(config)
                     else:
                         self.provider = ClaudeTranslationProvider(config)
                 return translate(segments,self.provider,config,job.source_language,job.target_language)
@@ -401,6 +450,10 @@ class Processor:
                         any(s.bbox and s.bbox.width > 0 for s in segments))
             if not is_agent:
                 segments=chunk_segments_to_word_limit(segments, max_words=getattr(config, 'max_words_per_segment', 4))
+            if not track:
+                from pipeline.subtitle_renderer import detect_line_regions
+                segments=self.stage(job,'STYLE_ANALYSIS',lambda:detect_line_regions(video,segments,config))
+            originals=copy.deepcopy(segments)
             segments=update_segment_boxes(segments, metadata, config)
             self.stage(job,'STYLE_ANALYSIS',lambda:assign_styles(segments,metadata,config,document))
             export_and_review_script(segments,job,config)
@@ -412,7 +465,7 @@ class Processor:
             (folder/'segments.json').write_text(json.dumps([asdict(s) for s in segments],ensure_ascii=False,indent=2),encoding='utf-8')
             output=self.stage(job,'RENDERING',lambda:render(video,subtitles,segments,config,folder,burned=not track,metadata=metadata))
             qc_segments = [s for s in segments if s.end > s.start + 0.01]
-            self.stage(job,'QC',lambda:check(metadata,output,qc_segments,qc_segments,config,config.metadata_dir/f'{job.job_id}_qc.json',warnings))
+            self.stage(job,'QC',lambda:check(metadata,output,originals,qc_segments,config,config.metadata_dir/f'{job.job_id}_qc.json',warnings))
             destination=config.completed_dir/output_filename(job.filename,job.target_language)
             # Copy to the destination filesystem first, then publish atomically without overwriting.
             staging=config.completed_dir/f'.{job.job_id}.partial'

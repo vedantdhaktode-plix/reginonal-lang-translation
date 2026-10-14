@@ -3,7 +3,7 @@ Stage 4 — Targeted Lip-Sync
 For each A-Roll shot:
   1. Extract video clip from source (exact frame bounds)
   2. Extract dubbed audio slice from master dubbed audio
-  3. Submit to Sync Labs lipsync-2-pro (active_speaker_detection on)
+  3. Submit to Sync Labs lipsync-2 (active_speaker_detection on)
   4. Cache by sha256(video_clip + audio_clip) — never re-calls if synced file exists
 
 For each B-Roll shot:
@@ -87,7 +87,7 @@ def process_shots(
     dubbed_audio: Path,
     classified_scenes: list[dict],
     job_dir: Path,
-    sync_model: str = "lipsync-2-pro",
+    sync_model: str = "lipsync-2",
     dry_run: bool = False,
 ) -> list[Path]:
     """
@@ -185,22 +185,53 @@ def process_shots(
             except Exception:
                 actual_dur = duration_s
 
-            MIN_SYNC_DURATION = 1.0  # Sync Labs rejects clips shorter than 1.0s
-            if actual_dur < MIN_SYNC_DURATION:
-                print(f"  [LipSync] A-Roll → clip too short ({actual_dur:.2f}s < {MIN_SYNC_DURATION}s) "
-                      f"— falling back to B-Roll mux")
+            # True sub-second microcuts (< 0.85s, e.g. 10-25 frames) produce visual popping and should not be warped
+            if actual_dur < 0.85:
+                print(f"  [LipSync] A-Roll → clip too short for neural sync ({actual_dur:.2f}s < 0.85s) "
+                      f"— falling back to clean B-Roll mux")
                 fallback_out = seg_dir / f"{prefix}_{time_key}_short_fallback.mp4"
                 if not fallback_out.exists():
                     _mux_audio_onto_video(raw_clip, audio_slice, fallback_out, actual_dur)
                 output_clips.append(fallback_out)
                 continue
 
+            # Clips between 0.85s and 1.02s (e.g. 0.97s from 30fps quantization of nominal 1s cuts):
+            # Sync Labs API rejects inputs strictly under 1.0s. Auto-pad with repeated end frame so Sync Labs accepts it,
+            # then trim back to the exact frame-locked duration upon download.
+            padded_needed = (actual_dur < 1.02)
+            send_clip = raw_clip
+            send_audio = audio_slice
+
+            if padded_needed:
+                pad_target = 1.06
+                padded_clip = seg_dir / f"{prefix}_{time_key}_padded.mp4"
+                padded_audio = seg_dir / f"{prefix}_{time_key}_padded.wav"
+                if not padded_clip.exists():
+                    subprocess.run([
+                        ffmpeg(), "-y", "-nostdin",
+                        "-i", str(raw_clip),
+                        "-vf", f"tpad=stop_mode=clone:stop_duration={pad_target - actual_dur:.4f}",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        str(padded_clip)
+                    ], capture_output=True)
+                if not padded_audio.exists():
+                    subprocess.run([
+                        ffmpeg(), "-y", "-nostdin",
+                        "-i", str(audio_slice),
+                        "-af", f"apad=whole_dur={pad_target:.4f}",
+                        "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
+                        str(padded_audio)
+                    ], capture_output=True)
+                if padded_clip.exists() and padded_audio.exists():
+                    send_clip = padded_clip
+                    send_audio = padded_audio
+
             # --- Submit to Sync Labs ---
             print(f"  [LipSync] A-Roll → uploading to Sync Labs {sync_model} "
                   f"({actual_dur:.2f}s, {raw_clip.stat().st_size // 1024}KB)...")
             try:
-                video_url = sync_client.upload_file(raw_clip, content_type="video/mp4")
-                audio_url = sync_client.upload_file(audio_slice, content_type="audio/wav")
+                video_url = sync_client.upload_file(send_clip, content_type="video/mp4")
+                audio_url = sync_client.upload_file(send_audio, content_type="audio/wav")
 
                 options = {
                     "sync_mode": "cut_off",
@@ -213,6 +244,20 @@ def process_shots(
                 print(f"  [LipSync] Sync Labs Job: {gen_id} — waiting...")
                 result = sync_client.wait_for_completion(gen_id, poll_interval=8)
                 sync_client.download_result(result["outputUrl"], synced_out)
+
+                # If clip was padded, trim back to exact original frame duration
+                if padded_needed and synced_out.exists():
+                    trimmed_tmp = seg_dir / f"{prefix}_{time_key}_trimmed.mp4"
+                    subprocess.run([
+                        ffmpeg(), "-y", "-nostdin",
+                        "-ss", "0", "-t", f"{actual_dur:.6f}",
+                        "-i", str(synced_out),
+                        "-c:v", "libx264", "-c:a", "copy",
+                        str(trimmed_tmp)
+                    ], capture_output=True)
+                    if trimmed_tmp.exists():
+                        trimmed_tmp.replace(synced_out)
+
                 print(f"  [LipSync] Downloaded → {synced_out.name}")
                 output_clips.append(synced_out)
 
@@ -226,5 +271,3 @@ def process_shots(
                 output_clips.append(fallback_out)
 
     return output_clips
-
-

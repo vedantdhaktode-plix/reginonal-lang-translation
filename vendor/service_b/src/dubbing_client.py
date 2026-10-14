@@ -2,7 +2,7 @@ import os
 import time
 from pathlib import Path
 import requests
-from .common import PipelineError
+from .common import PipelineError, request_with_retry
 from .srt_parser import parse_srt
 
 
@@ -47,8 +47,8 @@ class ElevenLabsDubbingClient:
         try:
             with open(media_path, "rb") as f:
                 files = {"file": (media_path.name, f, content_type)}
-                response = requests.post(url, headers=self.headers, data=data, files=files, timeout=120)
-        except requests.RequestException as e:
+                response = request_with_retry("POST", url, headers=self.headers, data=data, files=files, timeout=120, log_prefix="[Dubbing Client]")
+        except Exception as e:
             raise PipelineError(f"Network error while submitting to ElevenLabs Dubbing: {e}") from None
 
         if response.status_code != 200:
@@ -77,8 +77,8 @@ class ElevenLabsDubbingClient:
         """
         url = f"{self.base_url}/{dubbing_id}"
         try:
-            response = requests.get(url, headers=self.headers, timeout=30)
-        except requests.RequestException as e:
+            response = request_with_retry("GET", url, headers=self.headers, timeout=30, log_prefix="[Dubbing Client Status]")
+        except Exception as e:
             raise PipelineError(f"Failed to check ElevenLabs Dubbing status: {e}") from None
 
         if response.status_code == 404:
@@ -124,14 +124,14 @@ class ElevenLabsDubbingClient:
         url = f"{self.base_url}/{dubbing_id}/audio/{target_lang}"
 
         try:
-            with requests.get(url, headers=self.headers, stream=True, timeout=60) as resp:
+            with request_with_retry("GET", url, headers=self.headers, stream=True, timeout=60, log_prefix="[Dubbing Client Download]") as resp:
                 if resp.status_code != 200:
                     raise PipelineError(f"Failed to download dubbed audio: HTTP {resp.status_code}")
                 with open(output_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
-        except requests.RequestException as e:
+        except Exception as e:
             raise PipelineError(f"Network error downloading dubbed audio: {e}") from None
 
         if not output_path.exists() or output_path.stat().st_size == 0:
@@ -148,11 +148,11 @@ class ElevenLabsDubbingClient:
         url = f"{self.base_url}/{dubbing_id}/transcript/{target_lang}?format_type={format_type}"
 
         try:
-            resp = requests.get(url, headers=self.headers, timeout=30)
+            resp = request_with_retry("GET", url, headers=self.headers, timeout=30, log_prefix="[Dubbing Client Transcript]")
             if resp.status_code != 200:
                 raise PipelineError(f"Failed to download dubbed transcript: HTTP {resp.status_code}")
             output_path.write_text(resp.text, encoding="utf-8")
-        except requests.RequestException as e:
+        except Exception as e:
             raise PipelineError(f"Network error downloading dubbed transcript: {e}") from None
 
         if format_type == "srt":
